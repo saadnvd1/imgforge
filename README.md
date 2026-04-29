@@ -97,7 +97,7 @@ Templates are markdown files in `templates/`. Add your own.
 
 ## Use with AI coding agents
 
-imgforge includes a `SKILL.md` that AI coding agents (Claude Code, Codex, etc.) can read to use the tool effectively. Instead of writing naive prompts, the agent reads your templates first and writes structured prompts that produce better results.
+imgforge includes a `SKILL.md` that AI coding agents (Claude Code, Codex, etc.) can read to use the tool effectively. Instead of writing naive prompts, the agent references the built-in prompt examples and writes structured prompts that produce better results.
 
 Just point your agent at the repo and ask it to generate an image — it handles the rest.
 
