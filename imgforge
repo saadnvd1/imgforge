@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+"""imgforge — zero-dependency CLI for OpenAI image generation and editing.
+
+Generate images from text, edit existing images, estimate costs — all from
+your terminal. No SDK, no pip install, no virtual env. Just Python 3.10+
+and an API key.
+
+Usage:
+    imgforge generate "a neon sign that says OPEN 24/7"
+    imgforge edit photo.jpg "make it look like a watercolor painting"
+    imgforge cost --size 2k --quality high --count 5
+    imgforge templates
+
+https://saadnaveed.com
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+__version__ = "0.1.0"
+
+# ---------------------------------------------------------------------------
+# Pricing (USD per image, as of April 2026)
+# ---------------------------------------------------------------------------
+PRICING = {
+    "low":    {"1024x1024": 0.011, "1024x1536": 0.016, "1536x1024": 0.016, "auto": 0.011},
+    "medium": {"1024x1024": 0.042, "1024x1536": 0.063, "1536x1024": 0.063, "auto": 0.042},
+    "high":   {"1024x1024": 0.167, "1024x1536": 0.250, "1536x1024": 0.250, "auto": 0.167},
+}
+
+# Sizes above standard tiers get charged at the high-res rate.
+HIGH_RES_PRICE = {"low": 0.020, "medium": 0.070, "high": 0.280}
+
+# ---------------------------------------------------------------------------
+# Size aliases
+# ---------------------------------------------------------------------------
+SIZES = {
+    "square":    "1024x1024",
+    "portrait":  "1024x1536",
+    "landscape": "1536x1024",
+    "hd":        "2048x2048",
+    "wide":      "1536x1024",
+    "1k":        "1024x1024",
+    "2k":        "2048x2048",
+    "4k":        "3840x2160",
+}
+
+DEFAULT_MODEL = "gpt-image-2"
+DEFAULT_QUALITY = "auto"
+DEFAULT_SIZE = "1024x1024"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def resolve_size(raw: str) -> str:
+    return SIZES.get(raw.lower(), raw)
+
+
+def slugify(text: str, limit: int = 40) -> str:
+    s = re.sub(r"[^\w\s-]", "", text.lower()).strip()
+    return re.sub(r"[\s-]+", "-", s)[:limit] or "image"
+
+
+def output_path(prompt: str, fmt: str, dest: str | None) -> Path:
+    if dest:
+        return Path(dest).expanduser().resolve()
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return Path.cwd() / f"{ts}-{slugify(prompt)}.{fmt}"
+
+
+def estimate_cost(quality: str, size: str, count: int) -> float:
+    q = quality if quality in PRICING else "high"
+    tier = PRICING[q]
+    price = tier.get(size, HIGH_RES_PRICE.get(q, 0.280))
+    return price * count
+
+
+def api_key() -> str:
+    key = os.environ.get("OPENAI_API_KEY", "")
+    if not key:
+        die("OPENAI_API_KEY not set. Export it or add to your shell profile.", 2)
+    return key
+
+
+def api_request(endpoint: str, payload: dict | bytes, headers: dict) -> dict:
+    """Make a request to OpenAI API. payload is JSON dict or multipart bytes."""
+    url = f"https://api.openai.com/v1/{endpoint}"
+
+    if isinstance(payload, dict):
+        data = json.dumps(payload).encode()
+        headers["Content-Type"] = "application/json"
+    else:
+        data = payload
+
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")[:2000]
+        try:
+            err = json.loads(body)
+            msg = err.get("error", {}).get("message", body)
+        except json.JSONDecodeError:
+            msg = body
+        die(f"API {e.code}: {msg}")
+    except urllib.error.URLError as e:
+        die(f"Network error: {e.reason}")
+    return {}  # unreachable, satisfies type checker
+
+
+def build_multipart(fields: dict, files: list[tuple[str, str, bytes]]) -> tuple[bytes, str]:
+    """Build multipart/form-data body. Returns (body_bytes, content_type)."""
+    boundary = f"----imgforge-{datetime.now().strftime('%s')}"
+    parts: list[bytes] = []
+
+    for name, value in fields.items():
+        if value is None:
+            continue
+        parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+            f"{value}\r\n".encode()
+        )
+
+    for field_name, filename, content in files:
+        parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{field_name}"; filename="{filename}"\r\n'
+            f"Content-Type: application/octet-stream\r\n\r\n".encode()
+            + content
+            + b"\r\n"
+        )
+
+    parts.append(f"--{boundary}--\r\n".encode())
+    body = b"".join(parts)
+    content_type = f"multipart/form-data; boundary={boundary}"
+    return body, content_type
+
+
+def save_images(data: list[dict], dest: Path, fmt: str, count: int) -> list[Path]:
+    """Decode and write images to disk. Returns list of written paths."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    saved: list[Path] = []
+
+    for i, item in enumerate(data):
+        b64 = item.get("b64_json")
+        if not b64:
+            print(f"warning: image {i} has no data, skipping", file=sys.stderr)
+            continue
+
+        raw = base64.b64decode(b64)
+        if count == 1:
+            target = dest
+        else:
+            target = dest.with_stem(f"{dest.stem}-{i + 1}")
+
+        target.write_bytes(raw)
+        saved.append(target)
+
+    return saved
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def cmd_generate(args: argparse.Namespace) -> int:
+    key = api_key()
+    size = resolve_size(args.size)
+    fmt = args.format or "png"
+    dest = output_path(args.prompt, fmt, args.output)
+    count = args.count
+
+    est = estimate_cost(args.quality, size, count)
+    print(f"Generating {count} image{'s' if count > 1 else ''} "
+          f"({size}, {args.quality}) — est. ${est:.3f}")
+
+    payload: dict = {
+        "model": args.model,
+        "prompt": args.prompt,
+        "size": size,
+        "quality": args.quality,
+        "n": count,
+        "output_format": fmt,
+    }
+    if args.background:
+        payload["background"] = args.background
+    if args.moderation:
+        payload["moderation"] = args.moderation
+
+    headers = {"Authorization": f"Bearer {key}"}
+    result = api_request("images/generations", payload, headers)
+
+    images = result.get("data", [])
+    if not images:
+        die("API returned no images")
+
+    saved = save_images(images, dest, fmt, count)
+    for p in saved:
+        print(f"  {p}")
+
+    print(f"Done — ${est:.3f} estimated")
+    return 0
+
+
+def cmd_edit(args: argparse.Namespace) -> int:
+    print("Note: OpenAI's edits endpoint does not yet support gpt-image-2.",
+          file=sys.stderr)
+    print("      This will work once OpenAI enables it. Attempting anyway...",
+          file=sys.stderr)
+    print(file=sys.stderr)
+    key = api_key()
+    size = resolve_size(args.size)
+    fmt = args.format or "png"
+    dest = output_path(args.instruction, fmt, args.output)
+    count = args.count
+
+    # Validate input files
+    for img_path in args.image:
+        if not Path(img_path).is_file():
+            die(f"File not found: {img_path}", 2)
+    if args.mask and not Path(args.mask).is_file():
+        die(f"Mask not found: {args.mask}", 2)
+
+    est = estimate_cost(args.quality, size, count)
+    print(f"Editing {count} image{'s' if count > 1 else ''} "
+          f"({size}, {args.quality}) — est. ${est:.3f}")
+
+    # Build multipart form
+    fields = {
+        "model": args.model,
+        "prompt": args.instruction,
+        "size": size,
+        "n": str(count),
+    }
+
+    files: list[tuple[str, str, bytes]] = []
+    for img_path in args.image:
+        p = Path(img_path)
+        files.append(("image", p.name, p.read_bytes()))
+    if args.mask:
+        p = Path(args.mask)
+        files.append(("mask", p.name, p.read_bytes()))
+
+    body, content_type = build_multipart(fields, files)
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": content_type,
+    }
+    result = api_request("images/edits", body, headers)
+
+    images = result.get("data", [])
+    if not images:
+        die("API returned no images")
+
+    saved = save_images(images, dest, fmt, count)
+    for p in saved:
+        print(f"  {p}")
+
+    print(f"Done — ${est:.3f} estimated")
+    return 0
+
+
+def cmd_cost(args: argparse.Namespace) -> int:
+    size = resolve_size(args.size)
+    count = args.count
+
+    if args.quality == "all":
+        print(f"Cost estimates for {count} image{'s' if count > 1 else ''} at {size}:\n")
+        for q in ("low", "medium", "high"):
+            est = estimate_cost(q, size, count)
+            print(f"  {q:>6}  ${est:.3f}")
+        print()
+        return 0
+
+    est = estimate_cost(args.quality, size, count)
+    print(f"${est:.3f} — {count} image{'s' if count > 1 else ''}, "
+          f"{args.quality} quality, {size}")
+    return 0
+
+
+def cmd_templates(args: argparse.Namespace) -> int:
+    templates_dir = Path(__file__).resolve().parent / "templates"
+    if not templates_dir.is_dir():
+        die(f"Templates directory not found: {templates_dir}")
+
+    files = sorted(templates_dir.glob("*.md"))
+    if not files:
+        die("No templates found")
+
+    if args.name:
+        # Show a specific template
+        matches = [f for f in files if args.name.lower() in f.stem.lower()]
+        if not matches:
+            die(f"No template matching '{args.name}'")
+        for m in matches:
+            print(f"\n{'=' * 60}")
+            print(f" {m.stem}")
+            print(f"{'=' * 60}\n")
+            print(m.read_text())
+        return 0
+
+    # List all templates
+    print("Available templates:\n")
+    for f in files:
+        first_line = ""
+        for line in f.read_text().splitlines():
+            if line.strip() and not line.startswith("#"):
+                first_line = line.strip()
+                break
+        print(f"  {f.stem:<25} {first_line[:55]}")
+    print(f"\nRun: imgforge templates <name>  to view a template")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="imgforge",
+        description="Generate and edit images with OpenAI from your terminal. Zero dependencies.",
+        epilog="https://saadnaveed.com",
+    )
+    p.add_argument("-V", "--version", action="version",
+                   version=f"imgforge {__version__} — saadnaveed.com")
+
+    sub = p.add_subparsers(dest="command")
+
+    # -- generate --
+    gen = sub.add_parser("generate", aliases=["gen", "g"],
+                         help="Generate image(s) from a text prompt")
+    gen.add_argument("prompt", help="Text description of the image to generate")
+    gen.add_argument("-o", "--output", help="Output file path (auto-generated if omitted)")
+    gen.add_argument("-s", "--size", default=DEFAULT_SIZE,
+                     help="Image size: square, portrait, landscape, hd, wide, 1k, 2k, 4k, "
+                          "or WxH (default: 1024x1024)")
+    gen.add_argument("-q", "--quality", default=DEFAULT_QUALITY,
+                     choices=["auto", "low", "medium", "high"],
+                     help="Rendering quality — higher = better + more expensive (default: auto)")
+    gen.add_argument("-n", "--count", type=int, default=1,
+                     help="Number of images to generate (default: 1)")
+    gen.add_argument("-f", "--format", choices=["png", "jpeg", "webp"],
+                     help="Output format (default: png)")
+    gen.add_argument("--background", choices=["auto", "opaque"],
+                     help="Background handling (default: auto/transparent where supported)")
+    gen.add_argument("--moderation", choices=["auto", "low"],
+                     help="Content filter strictness")
+    gen.add_argument("--model", default=DEFAULT_MODEL,
+                     help=f"Model to use (default: {DEFAULT_MODEL})")
+
+    # -- edit --
+    ed = sub.add_parser("edit", aliases=["e"],
+                        help="Edit an existing image with a text instruction")
+    ed.add_argument("args", nargs="+",
+                    help="Image path(s) followed by instruction text (last argument)")
+    ed.add_argument("-o", "--output", help="Output file path (auto-generated if omitted)")
+    ed.add_argument("-m", "--mask", help="Mask image (transparent regions get regenerated)")
+    ed.add_argument("-s", "--size", default=DEFAULT_SIZE,
+                    help="Output size (default: 1024x1024)")
+    ed.add_argument("-q", "--quality", default=DEFAULT_QUALITY,
+                    choices=["auto", "low", "medium", "high"],
+                    help="Rendering quality (default: auto)")
+    ed.add_argument("-n", "--count", type=int, default=1,
+                    help="Number of variations (default: 1)")
+    ed.add_argument("-f", "--format", choices=["png", "jpeg", "webp"],
+                    help="Output format (default: png)")
+    ed.add_argument("--background", choices=["auto", "opaque"],
+                    help="Background handling")
+    ed.add_argument("--model", default=DEFAULT_MODEL,
+                    help=f"Model to use (default: {DEFAULT_MODEL})")
+
+    # -- cost --
+    c = sub.add_parser("cost", aliases=["c"],
+                       help="Estimate cost without generating anything")
+    c.add_argument("-s", "--size", default=DEFAULT_SIZE,
+                   help="Image size (default: 1024x1024)")
+    c.add_argument("-q", "--quality", default="all",
+                   help="Quality tier or 'all' to compare (default: all)")
+    c.add_argument("-n", "--count", type=int, default=1,
+                   help="Number of images (default: 1)")
+
+    # -- templates --
+    t = sub.add_parser("templates", aliases=["t"],
+                       help="Browse built-in prompt templates")
+    t.add_argument("name", nargs="?", help="Template name to view (partial match)")
+
+    return p
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return 0
+
+    cmd = args.command
+    if cmd in ("generate", "gen", "g"):
+        return cmd_generate(args)
+    elif cmd in ("edit", "e"):
+        # Split positionals: last arg is instruction, rest are image paths
+        if len(args.args) < 2:
+            die("edit requires at least one image and an instruction.\n"
+                "Usage: imgforge edit <image>... \"<instruction>\"", 2)
+        args.instruction = args.args[-1]
+        args.image = args.args[:-1]
+        return cmd_edit(args)
+    elif cmd in ("cost", "c"):
+        return cmd_cost(args)
+    elif cmd in ("templates", "t"):
+        return cmd_templates(args)
+
+    parser.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

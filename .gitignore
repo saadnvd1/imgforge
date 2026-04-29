@@ -1,0 +1,8 @@
+*.png
+*.jpg
+*.jpeg
+*.webp
+!docs/*.png
+fig/
+__pycache__/
+.env
