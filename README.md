@@ -95,16 +95,11 @@ Built-in prompt templates for common use cases:
 
 Templates are markdown files in `templates/`. Add your own.
 
-## Agent skill
+## Use with AI coding agents
 
-imgforge ships with a `SKILL.md` for use as an agentic skill in Claude Code and other skill-capable runtimes. When an agent loads the skill, it knows how to:
+imgforge includes a `SKILL.md` that AI coding agents (Claude Code, Codex, etc.) can read to use the tool effectively. Instead of writing naive prompts, the agent reads your templates first and writes structured prompts that produce better results.
 
-- Read the right template before generating (writes better prompts)
-- Pick size and quality based on intent
-- Show cost estimates
-- Handle errors and moderation blocks
-
-No plugin system or marketplace required — the skill definition is just a markdown file.
+Just point your agent at the repo and ask it to generate an image — it handles the rest.
 
 ## Requirements
 
